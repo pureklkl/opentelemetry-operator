@@ -18,9 +18,11 @@ package podmutation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,14 +60,22 @@ type PodMutator interface {
 }
 
 // NewWebhookHandler creates a new WebhookHandler.
-func NewWebhookHandler(cfg config.Config, logger logr.Logger, decoder admission.Decoder, cl client.Client, podMutators []PodMutator) WebhookHandler {
-	return &podMutationWebhook{
+func NewWebhookHandler(cfg config.Config, logger logr.Logger, decoder admission.Decoder, cl client.Client, podMutators []PodMutator, limiter *rate.Limiter) WebhookHandler {
+	var podMutationWebhook = podMutationWebhook{
 		config:      cfg,
 		decoder:     decoder,
 		logger:      logger,
 		client:      cl,
 		podMutators: podMutators,
 	}
+	if limiter != nil {
+		return &podMutationWebhookWithRateLimit{
+			podMutationWebhook: podMutationWebhook,
+			limiter:            limiter,
+			loggerLimiter:      rate.NewLimiter(0.2, 1),
+		}
+	}
+	return &podMutationWebhook
 }
 
 func (p *podMutationWebhook) Handle(ctx context.Context, req admission.Request) admission.Response {
@@ -105,4 +115,26 @@ func (p *podMutationWebhook) Handle(ctx context.Context, req admission.Request) 
 		return res
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
+}
+
+type podMutationWebhookWithRateLimit struct {
+	podMutationWebhook
+	limiter       *rate.Limiter
+	loggerLimiter *rate.Limiter
+}
+
+var ErrRateLimited = errors.New("pod webhook rate limit excceed")
+
+func (p *podMutationWebhookWithRateLimit) Handle(ctx context.Context, req admission.Request) admission.Response {
+	if !p.limiter.Allow() {
+		res := admission.Errored(http.StatusTooManyRequests, ErrRateLimited)
+		// same as podMutationWebhook.Handle
+		res.Allowed = true
+		if p.loggerLimiter.Allow() {
+			p.logger.Error(nil, "rate limit reached, pod not instrumented, this message is rate limited to show once per 5 second")
+		}
+		return res
+	}
+
+	return p.podMutationWebhook.Handle(ctx, req)
 }

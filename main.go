@@ -17,11 +17,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/spf13/pflag"
 	colfeaturegate "go.opentelemetry.io/collector/featuregate"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/time/rate"
 	networkingv1 "k8s.io/api/networking/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -145,6 +148,7 @@ func main() {
 		encodeTimeKey                    string
 		encodeLevelFormat                string
 		fipsDisabledComponents           string
+		podWebhookRateLimit              []string
 	)
 
 	pflag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
@@ -186,6 +190,7 @@ func main() {
 	pflag.StringVar(&encodeLevelFormat, "zap-level-format", "uppercase", "The level format to be used in the customized Log Encoder")
 	pflag.StringVar(&fipsDisabledComponents, "fips-disabled-components", "uppercase", "Disabled collector components when operator runs on FIPS enabled platform. Example flag value =receiver.foo,receiver.bar,exporter.baz")
 	pflag.IntVar(&webhookPort, "webhook-port", 9443, "The port the webhook endpoint binds to.")
+	pflag.StringSliceVar(&podWebhookRateLimit, "pod-webhook-rate-limit", []string{}, "Set rate and burst with comma seprated to enabled rate limit for pod webhook. For example 5,10 means 5 request per second with 10 at burst. Check https://pkg.go.dev/golang.org/x/time/rate#NewLimiter for details")
 	pflag.Parse()
 
 	// Using labelfilters both from label and labels-filter flags, until label flag is removed
@@ -467,17 +472,19 @@ func main() {
 		//	setupLog.Error(err, "unable to create webhook", "webhook", "TargetAllocator")
 		//	os.Exit(1)
 		//}
+		var limiter *rate.Limiter = parseRateLimit(podWebhookRateLimit, "pod webhook rate limiter")
 		if err = otelv1alpha1.SetupInstrumentationWebhook(mgr, cfg); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "Instrumentation")
 			os.Exit(1)
 		}
+
 		decoder := admission.NewDecoder(mgr.GetScheme())
 		mgr.GetWebhookServer().Register("/mutate-v1-pod", &webhook.Admission{
 			Handler: podmutation.NewWebhookHandler(cfg, ctrl.Log.WithName("pod-webhook"), decoder, mgr.GetClient(),
 				[]podmutation.PodMutator{
 					sidecar.NewMutator(logger, cfg, mgr.GetClient()),
 					instrumentation.NewMutator(logger, mgr.GetClient(), mgr.GetEventRecorderFor("opentelemetry-operator"), cfg),
-				}),
+				}, limiter),
 		})
 
 		if err = otelv1alpha1.SetupOpAMPBridgeWebhook(mgr, cfg); err != nil {
@@ -554,6 +561,32 @@ func tlsConfigSetting(cfg *tls.Config, tlsOpt tlsConfig) {
 		setupLog.Error(err, "Failed to convert TLS cipher suite name to ID")
 	}
 	cfg.CipherSuites = cipherSuiteIDs
+}
+
+func parseRateLimit(opts []string, limiterName string) *rate.Limiter {
+	var limiter *rate.Limiter
+	if len(opts) == 2 {
+		limit, err := strconv.ParseFloat(opts[0], 64)
+		if err != nil {
+			setupLog.Error(err, fmt.Sprintf("unable to parse %v limit", limiterName))
+			os.Exit(1)
+		}
+		burst, err := strconv.Atoi(opts[1])
+		if err != nil {
+			setupLog.Error(err, fmt.Sprintf("unable to parse %v burst", limiterName))
+			os.Exit(1)
+		}
+		limiter = rate.NewLimiter(rate.Limit(limit), burst)
+		setupLog.Info(fmt.Sprintf("%v enabled with limit %v, burst %v", limiterName, limit, burst))
+		return limiter
+	} else if len(opts) == 0 {
+		setupLog.Info(fmt.Sprintf("%v disabled", limiterName))
+		return nil
+	} else {
+		setupLog.Error(errors.New("wrong rate limiter paratmeters"), fmt.Sprintf("unable to parse %v parameters", limiterName))
+		os.Exit(1)
+	}
+	return nil
 }
 
 func parseFipsFlag(fipsFlag string) ([]string, []string, []string, []string) {
